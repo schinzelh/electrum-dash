@@ -34,7 +34,7 @@ import x11_hash
 # If you change its value, be sure to delete your 'recent_servers' file.
 # You may also need to remove the 'server' option from your config file.
 # Otherwise, you may end up getting headers for the wrong chain!
-TESTNET = False
+TESTNET = True
 PUBKEY_ADDR = 139 if TESTNET else 76
 SCRIPT_ADDR = 19 if TESTNET else 16
 WIF = 239 if TESTNET else 204
