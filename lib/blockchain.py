@@ -62,7 +62,7 @@ def target_to_bits(target):
     return new_bits
 
 
-class Blockchain():
+class Blockchain(util.PrintError):
     '''Manages blockchain headers and their verification'''
     def __init__(self, config, network):
         self.config = config
@@ -71,9 +71,6 @@ class Blockchain():
         self.headers_url = ''#https://headers.electrum.org/blockchain_headers'
         self.local_height = 0
         self.set_local_height()
-
-    def print_error(self, *msg):
-        util.print_error("[blockchain]", *msg)
 
     def height(self):
         return self.local_height

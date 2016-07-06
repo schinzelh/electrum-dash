@@ -5,6 +5,7 @@ from time import sleep
 import unicodedata
 import threading
 import re
+from functools import partial
 
 from PyQt4.Qt import QMessageBox, QDialog, QVBoxLayout, QLabel, QThread, SIGNAL, QGridLayout, QInputDialog, QPushButton
 import PyQt4.QtCore as QtCore
@@ -47,8 +48,8 @@ def give_error(message):
 
 class Plugin(BasePlugin):
 
-    def __init__(self, config, name):
-        BasePlugin.__init__(self, config, name)
+    def __init__(self, parent, config, name):
+        BasePlugin.__init__(self, parent, config, name)
         self._is_available = self._init()
         self.wallet = None
         self.handler = None
@@ -127,35 +128,31 @@ class Plugin(BasePlugin):
     def load_wallet(self, wallet, window):
         self.print_error("load_wallet")
         self.wallet = wallet
-        self.window = window
         self.wallet.plugin = self
-        self.keepkey_button = StatusBarButton(QIcon(":icons/keepkey.png"), _("KeepKey"), self.settings_dialog)
+        self.keepkey_button = StatusBarButton(QIcon(":icons/keepkey.png"), _("KeepKey"), partial(self.settings_dialog, window))
         if type(window) is ElectrumWindow:
-            self.window.statusBar().addPermanentWidget(self.keepkey_button)
+            window.statusBar().addPermanentWidget(self.keepkey_button)
         if self.handler is None:
-            self.handler = KeepKeyQtHandler(self.window)
+            self.handler = KeepKeyQtHandler(window)
         try:
             self.get_client().ping('t')
         except BaseException as e:
-            QMessageBox.information(self.window, _('Error'), _("KeepKey device not detected.\nContinuing in watching-only mode." + '\n\nReason:\n' + str(e)), _('OK'))
+            QMessageBox.information(window, _('Error'), _("KeepKey device not detected.\nContinuing in watching-only mode." + '\n\nReason:\n' + str(e)), _('OK'))
             self.wallet.force_watching_only = True
             return
         if self.wallet.addresses() and not self.wallet.check_proper_device():
-            QMessageBox.information(self.window, _('Error'), _("This wallet does not match your KeepKey device"), _('OK'))
+            QMessageBox.information(window, _('Error'), _("This wallet does not match your KeepKey device"), _('OK'))
             self.wallet.force_watching_only = True
 
     @hook
-    def close_wallet(self):
-        if type(self.window) is ElectrumWindow:
-            self.window.statusBar().removeWidget(self.keepkey_button)
-
-    @hook
     def installwizard_load_wallet(self, wallet, window):
+        if type(wallet) != KeepKeyWallet:
+            return
         self.load_wallet(wallet, window)
 
     @hook
     def installwizard_restore(self, wizard, storage):
-        if storage.get('wallet_type') != 'keepkey': 
+        if storage.get('wallet_type') != 'keepkey':
             return
         seed = wizard.enter_seed_dialog("Enter your KeepKey seed", None, func=lambda x:True)
         if not seed:
@@ -195,11 +192,11 @@ class Plugin(BasePlugin):
             self.handler.stop()
 
 
-    def settings_dialog(self):
+    def settings_dialog(self, window):
         try:
             device_id = self.get_client().get_device_id()
         except BaseException as e:
-            self.window.show_message(str(e))
+            window.show_message(str(e))
             return
         get_label = lambda: self.get_client().features.label
         update_label = lambda: current_label_label.setText("Label: %s" % get_label())
@@ -234,11 +231,12 @@ class Plugin(BasePlugin):
         client = self.get_client()
         inputs = self.tx_inputs(tx, True)
         outputs = self.tx_outputs(tx)
-        #try:
-        signed_tx = client.sign_tx('Dash', inputs, outputs)[1]
-        #except Exception, e:
-        #    give_error(e)
-        #finally:
+        try:
+            signed_tx = client.sign_tx('Dash', inputs, outputs)[1]
+        except Exception, e:
+            self.handler.stop()
+            give_error(e)
+
         self.handler.stop()
 
         raw = signed_tx.encode('hex')
@@ -281,13 +279,12 @@ class Plugin(BasePlugin):
                         )
                         # find which key is mine
                         for x_pubkey in x_pubkeys:
-                            xpub, s = BIP32_Account.parse_xpubkey(x_pubkey)
-                            if xpub in self.xpub_path:
-                                xpub_n = self.get_client().expand_path(self.xpub_path[xpub])
-                                txinputtype.address_n.extend(xpub_n + s)
-                                break
-                            else:
-                                raise
+                            if is_extended_pubkey(x_pubkey):
+                                xpub, s = BIP32_Account.parse_xpubkey(x_pubkey)
+                                if xpub in self.xpub_path:
+                                    xpub_n = self.get_client().expand_path(self.xpub_path[xpub])
+                                    txinputtype.address_n.extend(xpub_n + s)
+                                    break
 
                 prev_hash = unhexlify(txin['prevout_hash'])
                 prev_index = txin['prevout_n']
@@ -476,11 +473,12 @@ class KeepKeyWallet(BIP32_HD_Wallet):
 
             ptx = self.transactions.get(tx_hash)
             if ptx is None:
-                ptx = self.network.synchronous_get([('blockchain.transaction.get', [tx_hash])])[0]
+                ptx = self.network.synchronous_get(('blockchain.transaction.get', [tx_hash]))
                 ptx = Transaction(ptx)
             prev_tx[tx_hash] = ptx
 
             for x_pubkey in txin['x_pubkeys']:
+                account_derivation = None
                 if not is_extended_pubkey(x_pubkey):
                     continue
                 xpub = x_to_xpub(x_pubkey)
@@ -488,7 +486,8 @@ class KeepKeyWallet(BIP32_HD_Wallet):
                     if v == xpub:
                         account_id = re.match("x/(\d+)'", k).group(1)
                         account_derivation = "44'/5'/%s'"%account_id
-                xpub_path[xpub] = account_derivation
+                if account_derivation is not None:
+                    xpub_path[xpub] = account_derivation
 
         self.plugin.sign_transaction(tx, prev_tx, xpub_path)
 
@@ -525,7 +524,7 @@ class KeepKeyGuiMixin(object):
             message = "Confirm address on KeepKey device to continue"
         else:
             message = "Check KeepKey device to continue"
-        self.handler.show_message(message)
+        self.handler.show_message(msg.code, message, self)
         return proto.ButtonAck()
 
     def callback_PinMatrixRequest(self, msg):
@@ -590,8 +589,10 @@ class KeepKeyQtHandler:
     def stop(self):
         self.win.emit(SIGNAL('keepkey_done'))
 
-    def show_message(self, msg):
+    def show_message(self, msg_code, msg, client):
+        self.messsage_code = msg_code
         self.message = msg
+        self.client = client
         self.win.emit(SIGNAL('message_dialog'))
 
     def get_pin(self, msg):
@@ -650,6 +651,11 @@ class KeepKeyQtHandler:
         l = QLabel(self.message)
         vbox = QVBoxLayout(self.d)
         vbox.addWidget(l)
+
+        if self.messsage_code in (3, 8):
+            vbox.addLayout(Buttons(CancelButton(self.d)))
+            self.d.connect(self.d, SIGNAL('rejected()'), self.client.cancel)
+
         self.d.show()
 
     def dialog_stop(self):
@@ -664,5 +670,5 @@ if KEEPKEY:
             except ConnectionError:
                 self.bad = True
                 raise
-    
+
             return resp

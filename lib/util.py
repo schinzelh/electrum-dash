@@ -3,9 +3,11 @@ import platform
 import shutil
 from datetime import datetime
 from decimal import Decimal
+import traceback
 import urlparse
 import urllib
 import threading
+from i18n import _
 
 def normalize_version(v):
     return [int(x) for x in re.sub(r'(\.0+)*$','', v).split(".")]
@@ -20,7 +22,6 @@ class NotEnoughFunds(Exception): pass
 
 class InvalidPassword(Exception):
     def __str__(self):
-        from i18n import _
         return _("Incorrect password")
 
 class MyEncoder(json.JSONEncoder):
@@ -30,8 +31,27 @@ class MyEncoder(json.JSONEncoder):
             return obj.as_dict()
         return super(MyEncoder, self).default(obj)
 
+class PrintError(object):
+    '''A handy base class'''
+    def diagnostic_name(self):
+        return self.__class__.__name__
 
-class DaemonThread(threading.Thread):
+    def print_error(self, *msg):
+        print_error("[%s]" % self.diagnostic_name(), *msg)
+
+    def print_msg(self, *msg):
+        print_msg("[%s]" % self.diagnostic_name(), *msg)
+
+class ThreadJob(PrintError):
+    """A job that is run periodically from a thread's main loop.  run() is
+    called from that thread's context.
+    """
+
+    def run(self):
+        """Called periodically from the thread"""
+        pass
+
+class DaemonThread(threading.Thread, PrintError):
     """ daemon thread that terminates cleanly """
 
     def __init__(self):
@@ -39,6 +59,28 @@ class DaemonThread(threading.Thread):
         self.parent_thread = threading.currentThread()
         self.running = False
         self.running_lock = threading.Lock()
+        self.job_lock = threading.Lock()
+        self.jobs = []
+
+    def add_jobs(self, jobs):
+        with self.job_lock:
+            self.jobs.extend(jobs)
+
+    def run_jobs(self):
+        # Don't let a throwing job disrupt the thread, future runs of
+        # itself, or other jobs.  This is useful protection against
+        # malformed or malicious server responses
+        with self.job_lock:
+            for job in self.jobs:
+                try:
+                    job.run()
+                except:
+                    traceback.print_exc(file=sys.stderr)
+
+    def remove_jobs(self, jobs):
+        with self.job_lock:
+            for job in jobs:
+                self.jobs.remove(job)
 
     def start(self):
         with self.running_lock:
@@ -52,12 +94,6 @@ class DaemonThread(threading.Thread):
     def stop(self):
         with self.running_lock:
             self.running = False
-
-    def print_error(self, *msg):
-        print_error("[%s]" % self.__class__.__name__, *msg)
-
-    def print_msg(self, *msg):
-        print_msg("[%s]" % self.__class__.__name__, *msg)
 
 
 
@@ -112,6 +148,13 @@ def user_dir():
     elif "LOCALAPPDATA" in os.environ:
         return os.path.join(os.environ["LOCALAPPDATA"], "Electrum-DASH")
     elif 'ANDROID_DATA' in os.environ:
+        try:
+            import jnius
+            env  = jnius.autoclass('android.os.Environment')
+            _dir =  env.getExternalStorageDirectory().getPath()
+            return _dir + '/electrum-dash/'
+        except ImportError:
+            pass
         return "/sdcard/electrum-dash/"
     else:
         #raise Exception("No home directory found in environment variables.")
@@ -145,13 +188,15 @@ def format_satoshis(x, is_diff=False, num_zeros = 0, decimal_point = 8, whitespa
         result = " " * (15 - len(result)) + result
     return result.decode('utf8')
 
-def format_time(timestamp):
-    import datetime
+def timestamp_to_datetime(timestamp):
     try:
-        time_str = datetime.datetime.fromtimestamp(timestamp).isoformat(' ')[:-3]
+        return datetime.fromtimestamp(timestamp)
     except:
-        time_str = "unknown"
-    return time_str
+        return None
+
+def format_time(timestamp):
+    date = timestamp_to_datetime(timestamp)
+    return date.isoformat(' ')[:-3] if date else _("Unknown")
 
 
 # Takes a timestamp and returns a string with the approximation of the age
@@ -343,7 +388,6 @@ import socket
 import errno
 import json
 import ssl
-import traceback
 import time
 
 class SocketPipe:
@@ -363,7 +407,7 @@ class SocketPipe:
     def get(self):
         while True:
             response, self.message = parse_json(self.message)
-            if response:
+            if response is not None:
                 return response
             try:
                 data = self.socket.recv(1024)
@@ -374,7 +418,7 @@ class SocketPipe:
             except socket.error, err:
                 if err.errno == 60:
                     raise timeout
-                elif err.errno in [11, 10035]:
+                elif err.errno in [11, 35, 10035]:
                     print_error("socket errno", err.errno)
                     time.sleep(0.1)
                     continue
@@ -486,3 +530,29 @@ class StoreDict(dict):
         if key in self.keys():
             dict.pop(self, key)
             self.save()
+
+
+
+
+def check_www_dir(rdir):
+    # rewrite index.html every time
+    import urllib, urlparse, shutil, os
+    if not os.path.exists(rdir):
+        os.mkdir(rdir)
+    index = os.path.join(rdir, 'index.html')
+    src = os.path.join(os.path.dirname(__file__), 'www', 'index.html')
+    shutil.copy(src, index)
+    files = [
+        "https://code.jquery.com/jquery-1.9.1.min.js",
+        "https://raw.githubusercontent.com/davidshimjs/qrcodejs/master/qrcode.js",
+        "https://code.jquery.com/ui/1.10.3/jquery-ui.js",
+        "https://code.jquery.com/ui/1.10.3/themes/smoothness/jquery-ui.css"
+    ]
+    for URL in files:
+        path = urlparse.urlsplit(URL).path
+        filename = os.path.basename(path)
+        path = os.path.join(rdir, filename)
+        if not os.path.exists(path):
+            print_error("downloading ", URL)
+            urllib.urlretrieve(URL, path)
+

@@ -5,6 +5,7 @@ from time import sleep
 import unicodedata
 import threading
 import re
+from functools import partial
 
 from PyQt4.Qt import QMessageBox, QDialog, QVBoxLayout, QLabel, QThread, SIGNAL, QGridLayout, QInputDialog, QPushButton
 import PyQt4.QtCore as QtCore
@@ -50,8 +51,8 @@ def give_error(message):
 
 class Plugin(BasePlugin):
 
-    def __init__(self, config, name):
-        BasePlugin.__init__(self, config, name)
+    def __init__(self, parent, config, name):
+        BasePlugin.__init__(self, parent, config, name)
         self._is_available = self._init()
         self.wallet = None
         self.handler = None
@@ -130,35 +131,31 @@ class Plugin(BasePlugin):
     def load_wallet(self, wallet, window):
         self.print_error("load_wallet")
         self.wallet = wallet
-        self.window = window
         self.wallet.plugin = self
-        self.trezor_button = StatusBarButton(QIcon(":icons/trezor.png"), _("Trezor"), self.settings_dialog)
+        self.trezor_button = StatusBarButton(QIcon(":icons/trezor.png"), _("Trezor"), partial(self.settings_dialog, window))
         if type(self.window) is ElectrumWindow:
-            self.window.statusBar().addPermanentWidget(self.trezor_button)
+            window.statusBar().addPermanentWidget(self.trezor_button)
         if self.handler is None:
-            self.handler = TrezorQtHandler(self.window)
+            self.handler = TrezorQtHandler(window)
         try:
             self.get_client().ping('t')
         except BaseException as e:
-            QMessageBox.information(self.window, _('Error'), _("Trezor device not detected.\nContinuing in watching-only mode." + '\n\nReason:\n' + str(e)), _('OK'))
+            QMessageBox.information(window, _('Error'), _("Trezor device not detected.\nContinuing in watching-only mode." + '\n\nReason:\n' + str(e)), _('OK'))
             self.wallet.force_watching_only = True
             return
         if self.wallet.addresses() and not self.wallet.check_proper_device():
-            QMessageBox.information(self.window, _('Error'), _("This wallet does not match your Trezor device"), _('OK'))
+            QMessageBox.information(window, _('Error'), _("This wallet does not match your Trezor device"), _('OK'))
             self.wallet.force_watching_only = True
 
     @hook
-    def close_wallet(self):
-        if type(self.window) is ElectrumWindow:
-            self.window.statusBar().removeWidget(self.trezor_button)
-
-    @hook
     def installwizard_load_wallet(self, wallet, window):
+        if type(wallet) != TrezorWallet:
+            return
         self.load_wallet(wallet, window)
 
     @hook
     def installwizard_restore(self, wizard, storage):
-        if storage.get('wallet_type') != 'trezor': 
+        if storage.get('wallet_type') != 'trezor':
             return
         seed = wizard.enter_seed_dialog("Enter your Trezor seed", None, func=lambda x:True)
         if not seed:
@@ -198,11 +195,11 @@ class Plugin(BasePlugin):
             self.handler.stop()
 
 
-    def settings_dialog(self):
+    def settings_dialog(self, window):
         try:
             device_id = self.get_client().get_device_id()
         except BaseException as e:
-            self.window.show_message(str(e))
+            window.show_message(str(e))
             return
         get_label = lambda: self.get_client().features.label
         update_label = lambda: current_label_label.setText("Label: %s" % get_label())
@@ -284,13 +281,12 @@ class Plugin(BasePlugin):
                         )
                         # find which key is mine
                         for x_pubkey in x_pubkeys:
-                            xpub, s = BIP32_Account.parse_xpubkey(x_pubkey)
-                            if xpub in self.xpub_path:
-                                xpub_n = self.get_client().expand_path(self.xpub_path[xpub])
-                                txinputtype.address_n.extend(xpub_n + s)
-                                break
-                            else:
-                                raise
+                            if is_extended_pubkey(x_pubkey):
+                                xpub, s = BIP32_Account.parse_xpubkey(x_pubkey)
+                                if xpub in self.xpub_path:
+                                    xpub_n = self.get_client().expand_path(self.xpub_path[xpub])
+                                    txinputtype.address_n.extend(xpub_n + s)
+                                    break
 
                 prev_hash = unhexlify(txin['prevout_hash'])
                 prev_index = txin['prevout_n']
@@ -479,11 +475,12 @@ class TrezorWallet(BIP32_HD_Wallet):
 
             ptx = self.transactions.get(tx_hash)
             if ptx is None:
-                ptx = self.network.synchronous_get([('blockchain.transaction.get', [tx_hash])])[0]
+                ptx = self.network.synchronous_get(('blockchain.transaction.get', [tx_hash]))
                 ptx = Transaction(ptx)
             prev_tx[tx_hash] = ptx
 
             for x_pubkey in txin['x_pubkeys']:
+                account_derivation = None
                 if not is_extended_pubkey(x_pubkey):
                     continue
                 xpub = x_to_xpub(x_pubkey)
@@ -491,7 +488,8 @@ class TrezorWallet(BIP32_HD_Wallet):
                     if v == xpub:
                         account_id = re.match("x/(\d+)'", k).group(1)
                         account_derivation = "44'/5'/%s'"%account_id
-                xpub_path[xpub] = account_derivation
+                if account_derivation is not None:
+                    xpub_path[xpub] = account_derivation
 
         self.plugin.sign_transaction(tx, prev_tx, xpub_path)
 
@@ -667,5 +665,5 @@ if TREZOR:
             except ConnectionError:
                 self.bad = True
                 raise
-    
+
             return resp
